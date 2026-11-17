@@ -1,0 +1,68 @@
+# Boat
+
+[Boat](https://boat.dev) is installed by its vendor's install script, through `.chezmoidata/install-scripts.yml`
+(see [install-scripts.md](install-scripts.md)), to `~/.ascii/bin/boat`.
+
+The vendor's script, and why the entry sets what it does:
+
+- It ends by running `boat onboard`, an interactive sign-in, reading `/dev/tty` when it can. The two `sed`
+  expressions replace both calls with `:`. The vendor suggests one, `s|"\$INSTALL_DIR/\$MODE" onboard|:|`, which
+  leaves `: < /dev/tty` behind; with no terminal (Dagu, Ansible) opening `/dev/tty` fails and so does the script.
+- With `$SHELL` set to bash or zsh it writes a PATH block and a `boat()` shell function into `~/.bashrc` or
+  `~/.zshrc` (and `~/.zshenv` or `~/.profile`). The PATH block puts the real binary first, and the function calls it
+  directly: both skip the API key wrapper. `SHELL: /bin/sh` makes the script leave the rc files alone, and the rc
+  modify scripts remove blocks an earlier install left (see [shell.md](shell.md)).
+- It links `~/.local/bin/boat` to the binary only when nothing else is there. chezmoi writes the wrapper first, so
+  the link is never made. It also links `/usr/local/bin/boat` when that is writable by the user, which it is not in
+  the workspaces.
+- No `sha256`: the script changes with each release. It checks the binary it downloads against Boat's checksums.
+- The binary updates itself (`--no-update` or `BOAT_NO_UPDATE=1` turns that off), so an unchanged entry is not
+  reinstalled for upgrades.
+
+## API key
+
+`~/.local/bin/boat` (`dot_local/bin/executable_boat`) is a wrapper. It reads the API key from OpenBao on each call
+and runs the real binary with it as `BOAT_API_KEY`, so the key is never in a config file and a rotation applies to
+the next call. A `BOAT_API_KEY` already in the environment is used as is. The wrapper is a file on `PATH`, not a
+shell alias, so agents, Dagu and scripts get the key too, not just interactive shells.
+
+## Current sandbox
+
+In interactive bash and zsh, `boat` is a shell function, `dot_config/shell/rc.d/boat.sh`, that runs the wrapper.
+After `boat new`, `start` or `fork` it exports the new sandbox as `BOAT_CURRENT_ID`, and after `boat prompt` the
+conversation as `BOAT_CURRENT_CONVO`, so later commands in that shell can omit them. This is what the vendor's rc
+function does. boat writes the IDs to the files named by `BOAT_CURRENT_ID_FILE` and `BOAT_CURRENT_CONVO_FILE`. A
+function is needed because a program cannot set variables in the shell that ran it. Scripts and agents, which read
+no rc file, run the wrapper and pass IDs explicitly.
+
+## Ledger
+
+The wrapper keeps the thread's [ledger](ledger.md) (`LEDGER_DB`, else `T3CODE_THREAD_ID`) up to date:
+
+- After a successful `boat new` or `boat fork`, it acquires `boat:sandbox/<id>` with the cleanup
+  `boat delete --yes [--org <org>] <id>`. It reads the ID from `BOAT_CURRENT_ID_FILE`, using the rc function's file
+  when one is set, so the shell's current sandbox still works. With `--count`, it records the IDs boat writes there.
+- After a successful `boat delete`, it releases the sandbox from whichever ledger holds it. An ID of `current`, or
+  no ID, means `BOAT_CURRENT_ID`.
+- Outside a thread, with no `LEDGER_DB`, it warns and records nothing. A ledger failure only warns: boat's exit
+  status is always its own.
+
+`boat run` creates its sandbox and deletes it again, so it is not recorded.
+
+Create a key with `boat api-key create` (signed in, or on the dashboard); the secret is shown once. Store it on the
+OpenBao server, in the `wyrwood` namespace (see [vault.md](vault.md)):
+
+```bash
+# Prompts without echo, so the key stays out of shell history; printf adds no newline (api_key=- keeps one)
+read -rsp 'Boat API key: ' key; echo
+printf %s "$key" | bao kv put -namespace=wyrwood kv/workspace/boat api_key=-
+unset key
+```
+
+Every workspace binding that uses boat must select a Wyrwood policy with:
+
+```hcl
+path "kv/data/workspace/boat" {
+  capabilities = ["read"]
+}
+```

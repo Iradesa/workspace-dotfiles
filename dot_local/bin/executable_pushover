@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# Based on aaronfagan/pushover-cli v1.2.3; managed by workspace-dotfiles.
+# Credentials are read at runtime through Wyrwood. See docs/vault.md.
+set -euo pipefail
+
+version="1.2.4-workspace"
+secret_root="${PUSHOVER_SECRET_ROOT:-kv/workspace/pushover}"
+secret_root="${secret_root%/}"
+recipient=""
+list_only=0
+supported_recipients=()
+user_key=""
+app_token=""
+title=""
+message=""
+url=""
+url_title=""
+device=""
+sound=""
+html=""
+monospace=""
+timestamp=""
+priority="0"
+retry="60"
+expire="3600"
+quiet=0
+
+usage() {
+  cat <<EOF_HELP
+Usage: pushover --recipient <recipient> --message 'Notification text' [options]
+       pushover --list-recipients
+
+Credentials come from $secret_root/<recipient> (user_key, app_token).
+bao uses the Wyrwood socket configured by BAO_ADDR; no local login is needed.
+Set PUSHOVER_SECRET_ROOT to use another namespace-relative KV directory.
+Omitting --recipient lists the configured recipients and exits with an error.
+
+Options:
+  --recipient     Recipient name (required). Use --list-recipients to see names.
+  --list-recipients
+                  List configured recipients without sending a notification.
+  --user          Override the Pushover user key.
+  --token         Override the Pushover application API token.
+  --title         Notification title.
+  --message       Notification message (required).
+  --url           Supplementary URL.
+  --url-title     Title for the supplementary URL.
+  --device        Target devices, comma separated (default: all).
+  --sound         Notification sound. See https://pushover.net/api#sounds
+  --html          Set to 1 to enable HTML.
+  --monospace     Set to 1 to enable monospace (cannot combine with HTML).
+  --timestamp     Unix timestamp (default: time received by Pushover).
+  --priority      Message priority (default: 0).
+  --retry         Emergency retry interval in seconds (default: 60).
+  --expire        Emergency expiration in seconds (default: 3600).
+  --version, -v   Print the version.
+  --quiet, -q     Silence output.
+  --help          Show this help.
+
+Example: pushover --recipient boblangley --title 'Build complete' --message 'All checks passed.'
+EOF_HELP
+}
+
+fail() {
+  if [[ "$quiet" -eq 0 ]]; then
+    printf 'pushover: %s\n' "$*" >&2
+  fi
+  exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --recipient)
+      if [[ $# -lt 2 || "$2" == --* ]]; then
+        recipient=""
+        shift
+      else
+        recipient="$2"
+        shift 2
+      fi
+      ;;
+    --user|--token|--title|--message|--url|--url-title|--device|--sound|--html|--monospace|--timestamp|--priority|--retry|--expire)
+      [[ $# -ge 2 && "$2" != --* ]] || fail "$1 requires a value."
+      case "$1" in
+        --user) user_key="$2" ;;
+        --token) app_token="$2" ;;
+        --title) title="$2" ;;
+        --message) message="$2" ;;
+        --url) url="$2" ;;
+        --url-title) url_title="$2" ;;
+        --device) device="$2" ;;
+        --sound) sound="$2" ;;
+        --html) html="$2" ;;
+        --monospace) monospace="$2" ;;
+        --timestamp) timestamp="$2" ;;
+        --priority) priority="$2" ;;
+        --retry) retry="$2" ;;
+        --expire) expire="$2" ;;
+      esac
+      shift 2
+      ;;
+    --config)
+      fail "Credentials are managed in OpenBao at $secret_root/<recipient> (user_key, app_token); see docs/vault.md."
+      ;;
+    --upgrade)
+      fail "This script is managed by workspace-dotfiles; update it through chezmoi."
+      ;;
+    --version|-v)
+      printf 'Pushover CLI - v%s (workspace-dotfiles; based on https://github.com/aaronfagan/pushover-cli/)\n' "$version"
+      exit 0
+      ;;
+    --quiet|-q) quiet=1; shift ;;
+    --list-recipients) list_only=1; shift ;;
+    --help) usage; exit 0 ;;
+    *) fail "Invalid argument: $1 (see --help)." ;;
+  esac
+done
+
+command -v jq >/dev/null 2>&1 || fail "jq is required."
+command -v bao >/dev/null 2>&1 || fail "bao is required to list recipients and read credentials through Wyrwood."
+
+bao_read() {
+  if [[ "$quiet" -eq 1 ]]; then
+    bao "$@" 2>/dev/null
+  else
+    bao "$@"
+  fi
+}
+
+load_recipients() {
+  local recipients_json recipient_names name
+  recipients_json=$(bao_read kv list -format=json "$secret_root") \
+    || fail "Cannot list recipients at $secret_root through Wyrwood; check the bound policy (see docs/vault.md)."
+  # Only direct child secrets with safe recipient names can be addressed.
+  recipient_names=$(jq -er '
+    if type == "array" then
+      [.[] | select(type == "string") | select(test("^[a-zA-Z0-9][a-zA-Z0-9_-]*$"))]
+      | unique | .[]
+    else error("Expected recipient names") end
+  ' 2>/dev/null <<<"$recipients_json") \
+    || fail "No supported recipients are configured at $secret_root."
+  while IFS= read -r name; do
+    supported_recipients+=("$name")
+  done <<<"$recipient_names"
+}
+
+print_recipients() {
+  printf 'Supported recipients:\n'
+  printf '  %s\n' "${supported_recipients[@]}"
+}
+
+if [[ "$list_only" -eq 1 || -z "$recipient" ]]; then
+  load_recipients
+  if [[ "$quiet" -eq 0 ]]; then
+    print_recipients
+  fi
+  if [[ "$list_only" -eq 1 ]]; then
+    exit 0
+  fi
+  fail "--recipient is required."
+fi
+
+[[ -n "$message" ]] || fail "--message is required."
+command -v curl >/dev/null 2>&1 || fail "curl is required."
+
+load_recipients
+recipient_supported=0
+for name in "${supported_recipients[@]}"; do
+  if [[ "$recipient" == "$name" ]]; then
+    recipient_supported=1
+    break
+  fi
+done
+if [[ "$recipient_supported" -ne 1 ]]; then
+  if [[ "$quiet" -eq 0 ]]; then
+    print_recipients >&2
+  fi
+  fail "Unsupported recipient: $recipient"
+fi
+secret_path="$secret_root/$recipient"
+
+read_credentials() {
+  bao_read kv get -format=json "$secret_path"
+}
+
+if [[ -z "$user_key" || -z "$app_token" ]]; then
+  # One read keeps both credentials at the same KV version. Do not cache to disk.
+  credentials=$(read_credentials) \
+    || fail "Cannot read $secret_path through Wyrwood; check the bound policy (see docs/vault.md)."
+  if [[ -z "$user_key" ]]; then
+    user_key=$(jq -er '.data.data.user_key | select(type == "string" and length > 0)' 2>/dev/null <<<"$credentials") \
+      || fail "$secret_path must contain a nonempty user_key string."
+  fi
+  if [[ -z "$app_token" ]]; then
+    app_token=$(jq -er '.data.data.app_token | select(type == "string" and length > 0)' 2>/dev/null <<<"$credentials") \
+      || fail "$secret_path must contain a nonempty app_token string."
+  fi
+  unset credentials
+fi
+
+if [[ "$quiet" -eq 0 ]]; then
+  printf 'Sending notification... '
+fi
+
+curl_args=(--silent --show-error --fail --connect-timeout 10 --max-time 30)
+if [[ "$quiet" -eq 1 ]]; then
+  curl_args=(--silent --fail --connect-timeout 10 --max-time 30)
+fi
+# form-string preserves literal text, including leading @ and < characters.
+if ! response=$(curl "${curl_args[@]}" \
+  --form-string "token=$app_token" \
+  --form-string "user=$user_key" \
+  --form-string "title=$title" \
+  --form-string "message=$message" \
+  --form-string "url=$url" \
+  --form-string "url_title=$url_title" \
+  --form-string "device=$device" \
+  --form-string "sound=$sound" \
+  --form-string "html=$html" \
+  --form-string "monospace=$monospace" \
+  --form-string "timestamp=$timestamp" \
+  --form-string "priority=$priority" \
+  --form-string "retry=$retry" \
+  --form-string "expire=$expire" \
+  https://api.pushover.net/1/messages.json); then
+  fail "Notification request failed."
+fi
+if ! jq -e '.status == 1' >/dev/null 2>&1 <<<"$response"; then
+  fail "Pushover did not accept the notification."
+fi
+if [[ "$quiet" -eq 0 ]]; then
+  printf 'success!\n'
+fi
