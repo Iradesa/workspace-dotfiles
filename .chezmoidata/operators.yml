@@ -4,9 +4,6 @@
 # run_onchange_after_git-operators.sh.tmpl. The matching private key must be loaded in the forwarded
 # ssh-agent (wyrwood can hold several); the .pub here only selects it.
 operators:
-  - handle: boblangley
-    name: Bob Langley
-    github_pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM+dlxMMudB7lYe1kLMO71wQJJZrsAmvnkJKRGZDxyN2 ssh-operator-boblangley"
   - handle: iradesa
     name: Katelyn Langley
     github_pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL9kRloIUhdc73ASY22snIUPvZBVe9NORSkuPiNt9k5f ssh-operator-iradesa"
